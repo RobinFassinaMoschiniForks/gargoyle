@@ -17,6 +17,323 @@ without reading the full chat.
 
 ## Active Plans
 
+### Plan: Timer APC Re-Entry Semantics Fix
+
+#### Objective
+
+Fix the timer/APC proof so the demos prove APC completion-routine execution rather than
+only proving that a waitable timer object became signaled.
+
+Definition of done:
+
+- x86, x64, ARM64, and ARM64EC no longer use the timer handle itself as the alertable wait
+  object for APC re-entry.
+- x86 and x64 local live validation proves actual APC re-entry, not merely a second
+  MessageBox caused by a signaled timer wait.
+- ARM64 and ARM64EC hosted `windows-11-arm` headless checks complete two benign rounds and
+  report at least one callback/re-entry event.
+- Docs explain the discovered weakness and the corrected wait semantics.
+- PR #23 is updated and stops short of merge.
+
+#### User Decisions And Assumptions
+
+User decisions:
+
+- 2026-05-11: User asked to plan a fix after analysis showed the POC was relying on timer
+  signaled-state wakeups rather than proving APC callback execution.
+- 2026-05-11: User prefers improving x86/x64 locally first, then validating ARM through
+  hosted Windows-on-Arm CI.
+
+Assumptions:
+
+- `SleepEx(INFINITE, TRUE)` or an equivalent alertable wait with no timer-handle object is
+  the right primitive for the APC proof path because it returns for APC delivery rather than
+  for the timer object becoming signaled.
+- The x86/x64 behavior change should remain a benign MessageBox proof of concept and should
+  not broaden into payload, persistence, or operational misuse features.
+- ARM64EC v1 should continue to prove build/run identity and APC semantics, not mixed x64 DLL
+  interop.
+
+#### Context And Evidence
+
+- GitHub Actions run `25645191500`, job `75272673545`, passed all builds and architecture
+  probes, then failed `arm64 --mode headless`.
+- Failure evidence: ARM64 completed `2/2` headless rounds with `0` timer/APC callbacks.
+- Local API probe showed `WaitForSingleObjectEx(timer, alertable)` returned `WAIT_OBJECT_0`
+  with `callbacks=0`, while `SleepEx(alertable)` subsequently returned `WAIT_IO_COMPLETION`
+  with `callbacks=1`.
+- Microsoft's waitable-timer APC documentation warns not to wait on the timer handle when
+  using a completion routine because the thread can wake from the timer becoming signaled
+  instead of from APC delivery.
+- Before the fix, `GargoyleArm64/reentry_arm64.asm`,
+  `GargoyleArm64EC/reentry_arm64ec.asm`, and `GargoyleX64/reentry_x64.nasm` all called
+  `WaitForSingleObjectEx(timer, INFINITE, TRUE)`.
+- Before the fix, `setup.nasm` built a Win32 tail-call chain around
+  `WaitForSingleObjectEx` using the timer handle, so x86 was subject to the same semantic
+  weakness.
+
+#### Scope
+
+In scope:
+
+- Replace timer-handle alertable waits with APC-specific alertable waits in x86, x64, ARM64,
+  and ARM64EC.
+- Add callback/re-entry counters or equally clear control-flow evidence for x86/x64, matching
+  the stricter ARM evidence.
+- Extend acceptance parsing/tests so local validation catches the old false-positive shape.
+- Update docs and PR notes with the discovery and corrected semantics.
+- Use hosted ARM CI to validate ARM64 and ARM64EC runtime behavior.
+
+Out of scope:
+
+- ARM32.
+- ARM64EC mixed x64 DLL interop.
+- Non-benign payloads, persistence, credential access, or generalized offensive framework
+  behavior.
+- Merging PR #23.
+
+#### Interfaces And Data Flow
+
+- Native configuration blocks should carry `SleepEx` or an equivalent alertable-wait API
+  address where PIC previously consumed `WaitForSingleObjectEx` for timer waits.
+- The setup PIC arms the waitable timer with the existing completion routine and completion
+  argument, then enters an alertable wait that can only satisfy the APC proof through APC
+  delivery.
+- The ARM callback/re-entry path increments an observable counter before restoring execute
+  permissions. The x86/x64 live paths prove the same semantics by entering `SleepEx` rather
+  than waiting on the timer handle, so the second MessageBox can no longer be produced by
+  timer-object signaled-state progress.
+- `--mode headless` should remain non-GUI and parse counter evidence from stdout.
+- `--mode live` should still show benign MessageBoxes, but validation should distinguish
+  initial handoff from APC-backed re-entry.
+
+#### Task Graph
+
+| ID | Task | Depends On | Owner | Files/Area | Validation |
+| --- | --- | --- | --- | --- | --- |
+| T1 | Add diagnostic evidence shape | none | main | `main.cpp`, `GargoyleX64/`, `GargoyleArm64/`, harness parsers | unit tests |
+| T2 | Fix x64 wait semantics | T1 | main | `GargoyleX64/main_x64.cpp`, `setup_x64.nasm`, `reentry_x64.nasm` | x64 live acceptance |
+| T3 | Fix x86 wait semantics | T1 | main | `main.cpp`, `setup.nasm`, optional gadget/trampoline layout | x86 live acceptance |
+| T4 | Fix ARM wait semantics | T1-T2 | main | `GargoyleArm64/`, `GargoyleArm64EC/` | hosted ARM smoke |
+| T5 | Update docs/tests/CI expectations | T1-T4 | main | `src/`, `tests/`, `docs/`, README, PR body | `just check`, `just ci` |
+
+#### Implementation Steps
+
+1. Add a minimal local repro test or native diagnostic expectation that demonstrates
+   `SleepEx`/alertable APC delivery returns `WAIT_IO_COMPLETION`, while waiting on the timer
+   handle can return `WAIT_OBJECT_0`.
+2. Update x64 first because its separate re-entry PIC is the simplest path: replace the
+   timer-handle wait with `SleepEx(INFINITE, TRUE)`, making the second live MessageBox
+   dependent on APC delivery rather than the timer object's signaled state.
+3. Update x86 carefully: preserve the stack-pivot/trampoline shape while replacing the
+   timer-handle wait chain with an alertable APC wait and adding observable re-entry evidence.
+4. Once local x86/x64 live checks prove true APC re-entry, apply the same wait primitive and
+   counter expectations to ARM64/ARM64EC.
+5. Push to PR #23, monitor `windows-11-arm`, and inspect logs. Stop after three new CI-fix
+   iterations or if ARM64EC ABI/call-check behavior requires a design choice.
+6. Update architecture docs to call out the false-positive weakness and the corrected proof.
+
+#### Validation
+
+Targeted checks:
+
+- `just check`
+- `just build-debug`
+- `just build-x64-debug`
+- `uv run --all-groups gargoyle-acceptance --configuration Debug --platform x86`
+- `uv run --all-groups gargoyle-acceptance --configuration Debug --platform x64`
+- `uv run --all-groups gargoyle-acceptance --configuration Debug --platform x86 --mode architecture --skip-build`
+- `uv run --all-groups gargoyle-acceptance --configuration Debug --platform x64 --mode architecture --skip-build`
+
+Canonical gate:
+
+- `just ci`
+
+Hosted gate:
+
+- PR #23 `Windows 11 ARM smoke`, especially ARM64 and ARM64EC headless modes.
+
+Manual or live checks:
+
+- Confirm the second visible MessageBox is tied to the `SleepEx` APC re-entry path rather
+  than timer signaled-state progress.
+
+#### Risks And Stop Conditions
+
+- Stop if the x86 stack-pivot/trampoline change requires a broader redesign than swapping the
+  alertable wait primitive.
+- Stop if ARM64EC raw PIC execution trips ARM64EC call-checking or thunking requirements that
+  need a design decision.
+- Stop after three new hosted ARM CI-fix iterations.
+- Stop if a proposed fix would broaden the project beyond benign local proof-of-concept
+  behavior.
+
+#### Artifact Index
+
+- PR #23: `https://github.com/JLospinoso/gargoyle/pull/23`
+- Failing ARM run: `https://github.com/JLospinoso/gargoyle/actions/runs/25645191500`
+- Microsoft waitable timer APC reference:
+  `https://learn.microsoft.com/en-us/windows/win32/sync/using-a-waitable-timer-with-an-asynchronous-procedure-call`
+
+#### Progress Log
+
+- 2026-05-11: Root cause identified: timer-handle waits can return from signaled timer state
+  before the APC completion routine runs.
+- 2026-05-11: Plan recorded before implementation.
+- 2026-05-11: Implemented `SleepEx(INFINITE, TRUE)` re-entry waits for x86, x64, ARM64, and
+  ARM64EC. Updated harness expectations, docs, and setup evidence labels.
+- 2026-05-11: Local validation passed: `just check`, x86 Debug/Release live acceptance, x64
+  Debug/Release live acceptance, and `just ci`.
+- 2026-05-11: Pushed `2a8c336`; hosted Windows build passed and hosted ARM smoke narrowed to
+  an ARM64EC access violation immediately after entering dynamic PIC memory. The likely cause
+  matches Microsoft's ARM64EC dynamic-code rule: plain `VirtualAlloc` executable pages are
+  classified as x64 dynamic code unless allocated with `MEM_EXTENDED_PARAMETER_EC_CODE`.
+- 2026-05-11: Added ARM64EC EC-code dynamic allocation, instruction-cache flushing, and
+  ARM64EC C++ API wrappers so MSVC-generated exit thunks handle Win32 calls from the PIC path.
+- 2026-05-11: Local validation for the ARM64EC fix passed: `just check`, `just ci`, and
+  `just docs`.
+- 2026-05-11: Hosted ARM fix iteration 1 failed at ARM64EC link time because the VS2022
+  ARM64EC import libraries did not resolve `VirtualAlloc2`. Switched EC allocation to resolve
+  `VirtualAlloc2` dynamically from `kernelbase.dll`.
+- 2026-05-11: Local validation after dynamic resolution passed: `just check` and `just ci`.
+- 2026-05-11: Hosted ARM fix iteration 2 built ARM64EC, then failed at runtime with
+  `VirtualAlloc2 EC_CODE PIC allocation failed (GetLastError=87)`. Adjusted allocation to
+  reserve EC-code address space with `VirtualAlloc2` before committing writable storage
+  inside that reservation.
+- 2026-05-11: Local validation after reserve-then-commit allocation passed: `just check` and
+  `just ci`.
+- 2026-05-11: Hosted run `25695045729` passed both `Windows build and Python checks` and
+  `Windows 11 ARM smoke`. ARM64 and ARM64EC headless checks completed the requested benign
+  timer/APC rounds.
+
+#### Handoff Packet
+
+- Branch: `codex/arm64-arm64ec-parity`
+- PR/issue: PR #23, issue #22
+- Current status: complete; PR #23 is updated, validated, and ready for review/merge, but not
+  merged
+- Completed: failure analysis, fix plan, x86/x64/ARM64/ARM64EC wait semantic fix, harness and
+  docs updates
+- Remaining: none for this plan
+- Validation run: local API probe; `just check`; x86 Debug/Release live acceptance; x64
+  Debug/Release live acceptance; `just ci`; ARM64EC fix `just check`, `just ci`, and
+  `just docs`; dynamic `VirtualAlloc2` resolution fix `just check` and `just ci`;
+  reserve-then-commit allocation fix `just check` and `just ci`
+- Failed/skipped checks: local ARM build remains unavailable because this workstation lacks
+  ARM64/ARM64EC Visual Studio tools; PR #23 hosted ARM smoke validated ARM runtime instead
+- Residual risks: ARM64EC v1 still proves build/run/binary identity and APC semantics, not
+  mixed x64 DLL interop
+
+### Plan: Issue #22 ARM64/ARM64EC Parity And Windows-On-Arm CI Smoke
+
+#### Objective
+
+Add modern Windows-on-Arm parity through ARM64 and ARM64EC sibling demos, CI-safe
+architecture/runtime smoke coverage, and platform-aware acceptance tooling.
+
+Definition of done:
+
+- `Gargoyle.sln` contains `GargoyleArm64` and `GargoyleArm64EC` sibling projects.
+- ARM64 and ARM64EC demos build setup/re-entry PIC blobs with `armasm64`.
+- Existing x86/x64 binaries and new ARM binaries expose `--architecture-report`.
+- ARM binaries expose `--mode live|headless`, `--rounds`, and `--period-ms`.
+- `gargoyle-acceptance` supports `x86`, `x64`, `arm64`, and `arm64ec`, plus
+  `live`, `architecture`, `headless`, and `artifacts` modes.
+- GitHub Actions includes a hosted `windows-11-arm` smoke job.
+- Local canonical validation passes and ARM runtime validation is delegated to hosted ARM CI.
+
+#### User Decisions And Assumptions
+
+User decisions:
+
+- 2026-05-10: User approved the ARM64/ARM64EC plan and asked for implementation.
+- 2026-05-10: User chose a single focused PR and a creative non-GUI hosted ARM demo.
+
+Assumptions:
+
+- ARM32 remains out of scope because current Windows-on-Arm work is ARM64-centered.
+- ARM64EC v1 proves build/run identity and hosted Windows-on-Arm behavior, not mixed x64 DLL
+  interop.
+- Hosted ARM CI should run short benign console processes and avoid GUI automation.
+
+#### Scope
+
+In scope:
+
+- ARM64/ARM64EC project files, ARM PIC extraction, runtime harnesses, acceptance harness,
+  tests, docs, issue, PR, and CI.
+
+Out of scope:
+
+- ARM32.
+- Hosted CI MessageBox automation.
+- ARM64EC mixed x64 DLL interop.
+- Merging the PR.
+
+#### Interfaces And Data Flow
+
+- `--platform` accepts canonical lowercase values `x86`, `x64`, `arm64`, and `arm64ec`; MSBuild
+  receives `x86`, `x64`, `ARM64`, and `ARM64EC`.
+- `--mode live` builds, validates artifacts and PE machine, launches the demo, parses setup, and
+  closes MessageBox windows.
+- `--mode artifacts` builds unless skipped, validates required files, and checks PE machine.
+- `--mode architecture` runs `--architecture-report` and parses `platform`, `machine`, and
+  `pointer_bits`.
+- `--mode headless` runs `--mode headless` and parses setup output without MessageBox
+  automation.
+- `build/ArmPic.targets` assembles ARM PIC sources into COFF with `armasm64`, then
+  `build/extract_pic.py` extracts `.text` into raw `.pic` blobs.
+- `GARGOYLE_PLATFORM_TOOLSET` can override `PlatformToolset` for hosted ARM images that use a
+  compatible Visual Studio toolset such as `v143`.
+
+#### Validation
+
+Targeted checks:
+
+- `uv run --all-groups gargoyle-acceptance --configuration Debug --platform x86 --mode architecture --skip-build`
+- `uv run --all-groups gargoyle-acceptance --configuration Debug --platform x64 --mode architecture --skip-build`
+- `just check`
+- `just build-arm64-debug` was probed locally and reached the expected missing ARM toolset
+  failure.
+
+Canonical gate:
+
+- `just ci`
+
+Hosted gate:
+
+- `just windows-arm-smoke` on GitHub Actions `windows-11-arm`
+
+#### Risks And Stop Conditions
+
+- Stop if parallel native edits create conflicting artifact names or CLI flags.
+- Stop if CI runner availability for `windows-11-arm` requires user or repository-owner judgment.
+- Stop after three CI-fix iterations.
+
+#### Progress Log
+
+- 2026-05-10: Created issue #22 and branch `codex/arm64-arm64ec-parity`.
+- 2026-05-10: Added ARM64/ARM64EC projects, ARM PIC target, and COFF `.text` extractor.
+- 2026-05-10: Added ARM64/ARM64EC runtime demos with architecture-report, live, and headless
+  modes.
+- 2026-05-10: Extended the acceptance harness, tests, docs, and CI for ARM platforms and modes.
+- 2026-05-10: Local x86/x64 architecture acceptance passed for Debug outputs.
+- 2026-05-10: Local ARM build probe reached expected MSB8020 missing ARM toolset failure on this
+  workstation; hosted `windows-11-arm` CI is the runtime validation target.
+- 2026-05-10: `just check` and `just ci` passed locally.
+
+#### Handoff Packet
+
+- Branch: `codex/arm64-arm64ec-parity`
+- PR/issue: issue #22; PR pending
+- Current status: implementation complete locally; push, PR creation, and hosted CI remain
+- Completed: issue; project/build/runtime/harness/tests/docs/CI updates
+- Remaining: commit, push, open PR, monitor GitHub checks
+- Validation run: x86/x64 Debug architecture acceptance; `just check`; `just ci`
+- Failed/skipped checks: local ARM build skipped after expected missing ARM toolset failure
+- Residual risks: hosted `windows-11-arm` image/toolset behavior must validate ARM64 and ARM64EC
+  runtime smoke paths
+
 ### Plan: Native Quality Hardening
 
 #### Objective
