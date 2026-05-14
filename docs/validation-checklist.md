@@ -23,6 +23,8 @@ Run these before manual runtime validation:
 ```powershell
 uv sync --all-groups
 just build-all
+just build-arm-all
+just windows-arm-smoke
 just native-check
 just check
 ```
@@ -34,6 +36,8 @@ uv run --all-groups gargoyle-acceptance --configuration Debug
 uv run --all-groups gargoyle-acceptance --configuration Release
 uv run --all-groups gargoyle-acceptance --configuration Debug --platform x64
 uv run --all-groups gargoyle-acceptance --configuration Release --platform x64
+uv run --all-groups gargoyle-acceptance --configuration Debug --platform arm64 --mode artifacts
+uv run --all-groups gargoyle-acceptance --configuration Debug --platform arm64ec --mode artifacts
 ```
 
 Expected automated evidence:
@@ -42,6 +46,12 @@ Expected automated evidence:
   output directory.
 - `GargoyleX64.exe`, `setup_x64.pic`, and `reentry_x64.pic` exist in each x64
   output directory.
+- `GargoyleArm64.exe`, `setup_arm64.pic`, and `reentry_arm64.pic` exist for
+  ARM64 artifact smoke checks when the ARM project is present.
+- `GargoyleArm64EC.exe`, `setup_arm64ec.pic`, and `reentry_arm64ec.pic` exist
+  for ARM64EC artifact smoke checks when the ARM64EC project is present.
+- PE machine validation matches `I386`, `AMD64`, `ARM64`, or ARM64EC-compatible
+  final-image machine values to the requested harness platform.
 - MSVC code analysis completes for Debug/Release on x86 and x64 with warnings as
   errors.
 - AddressSanitizer Debug builds complete for x86 and x64 under `asan\`.
@@ -106,8 +116,9 @@ Expected automated evidence:
 - Watch for `VirtualProtectEx` calls that make the setup PIC executable before
   payload execution and non-executable afterward.
 
-- Watch for `SetWaitableTimer` and alertable `WaitForSingleObjectEx` behavior
-  that explains why the timer completion routine runs on re-entry.
+- Watch for `SetWaitableTimer` followed by alertable `SleepEx` behavior. The
+  demo should not wait on the timer handle itself for APC proof, because that
+  can wake from the timer object's signaled state before the APC callback runs.
 
 - Compare the fallback `gadget.pic` path with the system-DLL gadget path when
   `mshtml.dll` is absent or lacks a compatible pivot sequence.
@@ -121,7 +132,14 @@ CI-safe:
 
 - NASM assembly and Visual Studio compilation.
 - Python formatting, linting, typing, unit tests, and documentation builds.
-- Static checks that do not launch the interactive demo.
+- Static artifact and PE machine checks that do not launch the interactive demo.
+- Architecture-report checks that run with `--architecture-report` and do not
+  open MessageBox windows.
+- Headless ARM64 and ARM64EC smoke checks that run two benign timer/APC rounds
+  without MessageBox automation.
+- ARM64EC runtime checks that execute PIC from pages allocated as EC dynamic
+  code. Plain `VirtualAlloc` executable pages are treated as x64 dynamic code in
+  ARM64EC processes and do not prove native ARM64EC PIC execution.
 
 Desktop-only:
 
